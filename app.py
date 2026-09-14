@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import time
 import uuid
 import zipfile
@@ -30,6 +31,7 @@ from src.transcript import make_transcript_txt, safe_filename
 
 
 st.set_page_config(page_title="諮商理論技巧訓練 Agent", page_icon="🧭", layout="wide")
+LOGGER = logging.getLogger(__name__)
 
 
 def secrets_dict() -> dict[str, Any]:
@@ -62,6 +64,12 @@ def initialize_state() -> None:
         "otp_expires": 0.0,
         "otp_email": "",
         "otp_last_sent": 0.0,
+        "settings_cache": None,
+        "settings_cache_at": 0.0,
+        "usage_seconds_cache": None,
+        "usage_participant_id": "",
+        "usage_error": "",
+        "persistence_warnings": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -143,7 +151,10 @@ def login_page() -> None:
         st.caption(st.session_state.get("store_error", ""))
         return
     st.subheader("登入")
-    st.write("學生請用學校 `@hcu.edu.tw` 信箱接收驗證碼。教師測試帳號須列在系統白名單中。")
+    st.write(
+        "學生原則上請用學校 `@hcu.edu.tw` 信箱接收驗證碼；"
+        "經教師核准的學分班帳號可使用指定 Gmail。"
+    )
     email = normalize_email(st.text_input("登入 Email", value=st.session_state.otp_email))
     col1, col2 = st.columns(2)
     with col1:
@@ -203,13 +214,85 @@ def sidebar() -> None:
             logout()
 
 
-def settings_with_defaults() -> dict[str, str]:
+def settings_with_defaults(force: bool = False) -> dict[str, str]:
     values = dict(DEFAULT_SETTINGS)
+    cached = st.session_state.get("settings_cache")
+    cache_age = time.time() - float(st.session_state.get("settings_cache_at", 0.0) or 0.0)
+    if not force and isinstance(cached, dict) and cache_age < 60:
+        values.update(cached)
+        return values
     try:
-        values.update(STORE.get_settings())
+        remote = STORE.get_settings()
+        st.session_state.settings_cache = remote
+        st.session_state.settings_cache_at = time.time()
+        values.update(remote)
     except Exception:
-        pass
+        if isinstance(cached, dict):
+            values.update(cached)
     return values
+
+
+def safe_store_action(label: str, operation, *args, **kwargs) -> bool:
+    """Keep the student UI usable when a transient Sheets write fails."""
+    try:
+        operation(*args, **kwargs)
+        return True
+    except Exception:
+        LOGGER.exception("Google Sheets write failed: %s", label)
+        warnings = list(st.session_state.get("persistence_warnings", []))
+        if label not in warnings:
+            warnings.append(label)
+        st.session_state.persistence_warnings = warnings
+        return False
+
+
+def usage_seconds() -> int | None:
+    participant_id = st.session_state.participant_id
+    if (
+        st.session_state.get("usage_participant_id") == participant_id
+        and st.session_state.get("usage_seconds_cache") is not None
+    ):
+        return int(st.session_state.usage_seconds_cache)
+    try:
+        seconds = STORE.total_usage_seconds(participant_id)
+    except Exception:
+        LOGGER.exception("Unable to load accumulated usage")
+        st.session_state.usage_error = "累積時間暫時無法從 Google Sheets 讀取，請稍後重新整理。"
+        return None
+    st.session_state.usage_seconds_cache = seconds
+    st.session_state.usage_participant_id = participant_id
+    st.session_state.usage_error = ""
+    return seconds
+
+
+def add_completed_usage(session: dict[str, Any]) -> None:
+    if st.session_state.get("usage_participant_id") != session.get("participant_id"):
+        st.session_state.usage_seconds_cache = None
+        return
+    cached = st.session_state.get("usage_seconds_cache")
+    if cached is not None:
+        st.session_state.usage_seconds_cache = int(cached) + max(
+            0, int(session.get("duration_seconds", 0) or 0)
+        )
+
+
+def render_usage_progress() -> None:
+    seconds = usage_seconds()
+    if seconds is None:
+        st.info(st.session_state.get("usage_error", "累積時間暫時無法讀取。"))
+        return
+    target_minutes = CONFIG.semester_target_minutes
+    completed_minutes = seconds / 60
+    remaining_minutes = max(0.0, target_minutes - completed_minutes)
+    st.markdown("### 本學期上機累積")
+    c1, c2 = st.columns([1, 2])
+    c1.metric("已累積使用時間", f"{completed_minutes:.1f} / {target_minutes} 分鐘")
+    with c2:
+        st.progress(min(completed_minutes / target_minutes, 1.0))
+        if remaining_minutes > 0:
+            st.caption(f"距離本學期目標尚需 {remaining_minutes:.1f} 分鐘。以已結束並保存的 Session 計算。")
+        else:
+            st.success(f"已達成本學期 {target_minutes} 分鐘上機目標！")
 
 
 def parse_local_datetime(value: str) -> datetime | None:
@@ -269,7 +352,7 @@ def gemini() -> GeminiService:
 
 def store_turn(turn: dict[str, Any]) -> None:
     st.session_state.turns.append(turn)
-    STORE.append_turn(turn)
+    safe_store_action("本輪逐字稿", STORE.append_turn, turn)
 
 
 def generate_ai_turn(is_opening: bool, latest_student_message: str = "") -> None:
@@ -330,6 +413,7 @@ def start_new_session(mode: str, school_id: str, selected_ids: list[str], theme:
     st.session_state.continuation_snapshot = None
     st.session_state.prior_turns_context = []
     st.session_state.assessment = None
+    st.session_state.persistence_warnings = []
     STORE.start_session(session)
     generate_ai_turn(is_opening=True)
 
@@ -357,6 +441,7 @@ def start_continuation(thread: dict[str, Any], selected_ids: list[str]) -> None:
     st.session_state.continuation_snapshot = parse_json_cell(thread.get("latest_snapshot"), {})
     st.session_state.prior_turns_context = parse_json_cell(thread.get("recent_turns"), [])
     st.session_state.assessment = None
+    st.session_state.persistence_warnings = []
     STORE.start_session(session)
     generate_ai_turn(is_opening=True)
 
@@ -514,7 +599,7 @@ def render_chat() -> None:
             timezone=CONFIG.timezone,
             error_flag="immediate_risk_stop",
         ))
-        STORE.append("RiskEvents", {
+        safe_store_action("安全事件", STORE.append, "RiskEvents", {
             "risk_event_id": str(uuid.uuid4()),
             "session_id": session["session_id"],
             "participant_id": session["participant_id"],
@@ -524,7 +609,8 @@ def render_chat() -> None:
             "content_redacted": redact_for_preview(prompt),
         })
         st.session_state.active_session = finish_session(session, CONFIG.timezone, "safety_stopped")
-        STORE.finish_session(st.session_state.active_session)
+        if safe_store_action("Session 結束時間", STORE.finish_session, st.session_state.active_session):
+            add_completed_usage(st.session_state.active_session)
         st.rerun()
     try:
         with st.spinner("AI 正在回應…"):
@@ -544,7 +630,8 @@ def render_chat() -> None:
 def finalize_session() -> None:
     session = finish_session(st.session_state.active_session, CONFIG.timezone, "completed")
     st.session_state.active_session = session
-    STORE.finish_session(session)
+    if safe_store_action("Session 結束時間", STORE.finish_session, session):
+        add_completed_usage(session)
     raw = ""
     parsed: dict[str, Any]
     try:
@@ -593,9 +680,9 @@ def finalize_session() -> None:
         "parsed_json": parsed,
         "created_at": STORE.now(),
     }
-    STORE.save_assessment(record)
     st.session_state.assessment = parsed
     st.session_state.raw_assessment = raw
+    safe_store_action("形成性回饋", STORE.save_assessment, record)
 
     try:
         snapshot_raw = gemini().generate_text(
@@ -617,7 +704,7 @@ def finalize_session() -> None:
             "unfinished_issues": [],
             "next_session_focus": [],
         }
-    STORE.save_thread({
+    safe_store_action("續談摘要", STORE.save_thread, {
         "conversation_thread_id": session["conversation_thread_id"],
         "participant_id": session["participant_id"],
         "mode": session["mode"],
@@ -640,7 +727,16 @@ def render_feedback(settings: dict[str, str]) -> None:
     session = st.session_state.active_session
     assessment = st.session_state.assessment or {}
     st.subheader("本次晤談已完成")
-    st.success("完整逐字稿、練習時間、學派、技巧與形成性回饋已保存。你之後可選擇續談同一位 AI 對話角色。")
+    persistence_warnings = st.session_state.get("persistence_warnings", [])
+    if persistence_warnings:
+        st.warning(
+            "本次晤談已結束，畫面中的逐字稿與回饋仍可下載；"
+            "但 Google Sheets 暫時未完成部分同步（"
+            + "、".join(persistence_warnings)
+            + "）。請保留逐字稿並通知授課教師。"
+        )
+    else:
+        st.success("完整逐字稿、練習時間、學派、技巧與形成性回饋已保存。你之後可選擇續談同一位 AI 對話角色。")
     if as_bool(settings.get("student_feedback_visible"), True):
         if session["mode"] == "practice":
             if as_bool(settings.get("student_score_visible"), True) and assessment.get("total_score") is not None:
@@ -707,6 +803,7 @@ def student_page() -> None:
     if error and not is_teacher(st.session_state.email, CONFIG.teacher_emails):
         st.error(error)
         return
+    render_usage_progress()
     if not st.session_state.api_validated or not st.session_state.api_key:
         api_key_gate()
         return
@@ -768,6 +865,8 @@ def teacher_settings_panel(settings: dict[str, str]) -> None:
                     parse_local_datetime(open_end)
                 for key, value in updates.items():
                     STORE.save_setting(key, value, st.session_state.email)
+                st.session_state.settings_cache = None
+                st.session_state.settings_cache_at = 0.0
                 st.success("設定已儲存。")
             except Exception as exc:
                 st.error(f"設定未儲存：{exc}")
