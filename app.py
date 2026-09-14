@@ -368,7 +368,12 @@ def generate_ai_turn(is_opening: bool, latest_student_message: str = "") -> None
         is_opening=is_opening,
     )
     started = time.perf_counter()
-    response = gemini().generate_text(prompt, system_instruction=system, temperature=0.55, max_output_tokens=550)
+    response = gemini().generate_text(
+        prompt,
+        system_instruction=system,
+        temperature=0.55,
+        max_output_tokens=2048,
+    )
     latency = int((time.perf_counter() - started) * 1000)
     role = "ai_client" if session["mode"] == "practice" else "ai_counselor"
     store_turn(new_turn(
