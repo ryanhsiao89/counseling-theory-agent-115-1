@@ -19,6 +19,11 @@ def _string_tuple(value: Any, default: tuple[str, ...] = ()) -> tuple[str, ...]:
     return tuple(str(item).strip().lower() for item in value if str(item).strip())
 
 
+def _unique_strings(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    """Merge email/domain lists while preserving their configured order."""
+    return tuple(dict.fromkeys(item for group in groups for item in group))
+
+
 @dataclass(frozen=True)
 class AppConfig:
     app_title: str
@@ -32,17 +37,26 @@ class AppConfig:
     otp_ttl_seconds: int
     max_input_chars: int
     recent_context_turns: int
+    semester_target_minutes: int
 
     @classmethod
     def from_secrets(cls, secrets: Mapping[str, Any]) -> "AppConfig":
         app = _section(secrets, "app")
         auth = _section(secrets, "auth")
         legacy_test_emails = _string_tuple(app.get("teacher_test_emails"))
+        student_login_emails = _string_tuple(app.get("student_login_emails"))
         allowed_domains = _string_tuple(
             auth.get("allowed_domains", app.get("allowed_domains", app.get("allowed_domain"))),
             ("hcu.edu.tw",),
         )
-        login_allowlist = _string_tuple(auth.get("login_allowlist"), legacy_test_emails)
+        # teacher_test_emails is retained for compatibility with the existing
+        # Agents. student_login_emails grants login only; it never grants access
+        # to the teacher dashboard.
+        login_allowlist = _unique_strings(
+            legacy_test_emails,
+            student_login_emails,
+            _string_tuple(auth.get("login_allowlist")),
+        )
         teacher_emails = _string_tuple(auth.get("teacher_emails"), legacy_test_emails)
         return cls(
             app_title=str(app.get("title", "諮商理論技巧訓練 Agent")),
@@ -56,6 +70,7 @@ class AppConfig:
             otp_ttl_seconds=int(auth.get("otp_ttl_seconds", 600)),
             max_input_chars=int(app.get("max_input_chars", 800)),
             recent_context_turns=int(app.get("recent_context_turns", 14)),
+            semester_target_minutes=max(1, int(app.get("semester_target_minutes", 120))),
         )
 
 
