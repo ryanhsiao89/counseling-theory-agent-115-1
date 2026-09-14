@@ -9,12 +9,15 @@ import base64
 import binascii
 import hashlib
 import json
+import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import gspread
+from gspread.exceptions import APIError
 
 from .config import DEFAULT_SETTINGS
 
@@ -162,6 +165,9 @@ class GoogleSheetsStore:
         self.book = client.open_by_key(spreadsheet_id)
         self.timezone = timezone
         self.worksheets: dict[str, gspread.Worksheet] = {}
+        # Cache the exact row returned by append_row. Session completion can
+        # then update that row without reading the entire worksheet first.
+        self._row_cache: dict[tuple[str, str, str], int] = {}
         self.ensure_schema()
 
     @classmethod
@@ -232,24 +238,62 @@ class GoogleSheetsStore:
             for key, value in DEFAULT_SETTINGS.items():
                 self.append("Settings", {"key": key, "value": value, "updated_at": self.now(), "updated_by": "system"})
 
-    def append(self, sheet: str, record: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _run_with_retry(operation, attempts: int = 3):
+        """Retry transient Google Sheets quota/server errors briefly."""
+        transient_statuses = {429, 500, 502, 503, 504}
+        for attempt in range(attempts):
+            try:
+                return operation()
+            except APIError as exc:
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+                if attempt == attempts - 1 or status not in transient_statuses:
+                    raise
+                time.sleep(0.35 * (2 ** attempt))
+
+    @staticmethod
+    def _row_from_append_response(response: Any) -> int | None:
+        if not isinstance(response, Mapping):
+            return None
+        updated_range = str(response.get("updates", {}).get("updatedRange", ""))
+        match = re.search(r"![A-Z]+(\d+)(?::|$)", updated_range, re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    def append(self, sheet: str, record: Mapping[str, Any]) -> Any:
         headers = SCHEMAS[sheet]
         values = [json_cell(record.get(key, "")) for key in headers]
-        self.worksheets[sheet].append_row(values, value_input_option="RAW")
+        return self._run_with_retry(
+            lambda: self.worksheets[sheet].append_row(values, value_input_option="RAW")
+        )
 
     def all_records(self, sheet: str) -> list[dict[str, Any]]:
-        return self.worksheets[sheet].get_all_records(default_blank="")
+        return self._run_with_retry(
+            lambda: self.worksheets[sheet].get_all_records(default_blank="")
+        )
 
     def _upsert_by_key(self, sheet: str, key: str, value: str, record: Mapping[str, Any]) -> None:
         ws = self.worksheets[sheet]
         headers = SCHEMAS[sheet]
-        records = ws.get_all_records(default_blank="")
-        row_index = next((i + 2 for i, row in enumerate(records) if str(row.get(key, "")) == str(value)), None)
+        cache_key = (sheet, key, str(value))
+        row_index = self._row_cache.get(cache_key)
+        if row_index is None:
+            key_column = headers.index(key) + 1
+            key_values = self._run_with_retry(lambda: ws.col_values(key_column))
+            row_index = next(
+                (i + 1 for i, cell in enumerate(key_values) if str(cell) == str(value)),
+                None,
+            )
         values = [json_cell(record.get(header, "")) for header in headers]
         if row_index is None:
-            ws.append_row(values, value_input_option="RAW")
+            response = self._run_with_retry(
+                lambda: ws.append_row(values, value_input_option="RAW")
+            )
+            row_index = self._row_from_append_response(response)
         else:
-            ws.update(values=[values], range_name=f"A{row_index}")
+            self._run_with_retry(lambda: ws.update(values=[values], range_name=f"A{row_index}"))
+        if row_index is not None:
+            self._row_cache[cache_key] = row_index
 
     def get_or_create_participant(self, email: str, role: str, participant_salt: str) -> str:
         normalized = email.strip().lower()
@@ -273,7 +317,11 @@ class GoogleSheetsStore:
         return participant_id
 
     def start_session(self, session: Mapping[str, Any]) -> None:
-        self.append("Sessions", session)
+        response = self.append("Sessions", session)
+        row_index = self._row_from_append_response(response)
+        if row_index is not None:
+            cache_key = ("Sessions", "session_id", str(session["session_id"]))
+            self._row_cache[cache_key] = row_index
 
     def finish_session(self, session: Mapping[str, Any]) -> None:
         self._upsert_by_key("Sessions", "session_id", str(session["session_id"]), session)
@@ -314,6 +362,24 @@ class GoogleSheetsStore:
 
     def count_sessions(self, participant_id: str) -> int:
         return sum(1 for r in self.all_records("Sessions") if str(r.get("participant_id")) == participant_id)
+
+    def total_usage_seconds(self, participant_id: str) -> int:
+        """Sum completed usage once per unique Session."""
+        durations: dict[str, int] = {}
+        for row in self.all_records("Sessions"):
+            if str(row.get("participant_id", "")) != participant_id:
+                continue
+            if str(row.get("completion_status", "")) not in {"completed", "safety_stopped"}:
+                continue
+            try:
+                seconds = max(0, int(float(row.get("duration_seconds", 0) or 0)))
+            except (TypeError, ValueError):
+                seconds = 0
+            session_id = str(row.get("session_id", ""))
+            durations[session_id or f"row-{len(durations)}"] = max(
+                seconds, durations.get(session_id, 0)
+            )
+        return sum(durations.values())
 
     def session_turns(self, session_id: str) -> list[dict[str, Any]]:
         rows = [r for r in self.all_records("ChatLogs") if str(r.get("session_id")) == session_id]
@@ -370,6 +436,7 @@ class MemoryStore:
     get_settings = GoogleSheetsStore.get_settings
     save_setting = GoogleSheetsStore.save_setting
     count_sessions = GoogleSheetsStore.count_sessions
+    total_usage_seconds = GoogleSheetsStore.total_usage_seconds
     session_turns = GoogleSheetsStore.session_turns
     get_assessment = GoogleSheetsStore.get_assessment
     add_teacher_grade = GoogleSheetsStore.add_teacher_grade
