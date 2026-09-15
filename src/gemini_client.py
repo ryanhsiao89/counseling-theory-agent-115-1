@@ -3,12 +3,45 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from typing import Any
 
 from google import genai
 from google.genai import types
+
+
+class GeminiQuotaError(RuntimeError):
+    """The student's Google AI project has reached a request/token quota."""
+
+
+class GeminiAuthenticationError(RuntimeError):
+    """The supplied API key is invalid or not authorized."""
+
+
+def _retry_after_seconds(message: str) -> int | None:
+    match = re.search(r"retry(?:\s+in|delay['\":\s]+)\s*([0-9]+(?:\.[0-9]+)?)s", message, re.I)
+    return math.ceil(float(match.group(1))) if match else None
+
+
+def _friendly_api_exception(exc: Exception, model_name: str) -> RuntimeError | None:
+    message = str(exc)
+    lowered = message.lower()
+    if any(token in lowered for token in ("429", "resource_exhausted", "quota exceeded")):
+        retry_after = _retry_after_seconds(message)
+        advice = f"Google 建議約 {retry_after} 秒後再試。" if retry_after else "請稍後再試。"
+        if "perday" in lowered or "free_tier_requests" in lowered:
+            advice += "若仍無法使用，表示當日免費額度尚未重置。"
+        return GeminiQuotaError(
+            f"API Key 有效，但其 Google AI 專案的 {model_name} 免費額度已達上限。"
+            f"{advice}額度依 Google AI 專案計算，不是重新產生同一專案的 Key 就會歸零。"
+        )
+    if any(token in lowered for token in ("api_key_invalid", "api key not valid", "invalid api key")):
+        return GeminiAuthenticationError(
+            "Gemini API Key 無效。請回到 Google AI Studio 複製完整 Key，確認前後沒有空格後再貼上。"
+        )
+    return None
 
 
 def _finish_reason(response: Any) -> str:
@@ -74,9 +107,12 @@ class GeminiService:
                 )
                 text = (response.text or "").strip()
             except Exception as exc:  # SDK 的錯誤型別會隨版本調整，統一在此重試
+                friendly = _friendly_api_exception(exc, self.model_name)
+                if friendly is not None:
+                    raise friendly from exc
                 last_error = exc
                 message = str(exc).lower()
-                retryable = any(token in message for token in ("429", "quota", "resource_exhausted", "timeout", "503"))
+                retryable = any(token in message for token in ("timeout", "503"))
                 if not retryable or attempt == attempts - 1:
                     break
                 time.sleep(1.5 * (2**attempt))
@@ -103,16 +139,25 @@ class GeminiService:
         raise RuntimeError(f"Gemini 呼叫失敗：{last_error}") from last_error
 
     def validate_key(self) -> None:
-        result = self.generate_text(
-            "只回覆 OK。",
-            system_instruction="這是 API 連線測試。",
-            temperature=0.0,
-            max_output_tokens=256,
-            thinking_level="low",
-            attempts=1,
-        )
-        if "OK" not in result.upper():
-            raise RuntimeError("API Key 可呼叫，但模型未完成預期的連線測試。")
+        # Listing models validates authentication without consuming one of the
+        # student's generate_content requests.
+        try:
+            available = {
+                str(getattr(model, "name", "")).removeprefix("models/")
+                for model in self.client.models.list()
+            }
+        except Exception as exc:
+            friendly = _friendly_api_exception(exc, self.model_name)
+            if friendly is not None:
+                raise friendly from exc
+            raise RuntimeError("目前無法驗證 Gemini API Key，請稍後再試。") from exc
+        if not any(
+            name == self.model_name or name.startswith(f"{self.model_name}-")
+            for name in available
+        ):
+            raise RuntimeError(
+                f"API Key 可以連線，但目前無法使用課程指定模型 {self.model_name}。請通知授課教師。"
+            )
 
 
 def parse_json_response(raw: str) -> dict[str, Any]:
