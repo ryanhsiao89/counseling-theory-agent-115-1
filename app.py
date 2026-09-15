@@ -16,7 +16,7 @@ import streamlit as st
 from src.auth import create_otp, is_email_allowed, is_teacher, normalize_email, send_otp_email, verify_otp
 from src.config import AppConfig, DEFAULT_SETTINGS, as_bool
 from src.data_store import GoogleSheetsStore, MemoryStore, SCHEMAS, json_cell, parse_json_cell
-from src.gemini_client import GeminiService, parse_json_response
+from src.gemini_client import GeminiQuotaError, GeminiService, parse_json_response
 from src.prompts import (
     build_case_prompt,
     build_dialogue_prompt,
@@ -330,6 +330,7 @@ def api_key_gate() -> GeminiService | None:
         "請用個人的 `@gmail.com` 帳號到 Google AI Studio 申請 API Key，再貼到下方。"
         "Key 僅保留於目前瀏覽器工作階段，不會寫入 Google Sheets、逐字稿或研究資料。"
     )
+    st.caption("「測試 API Key」只檢查連線與模型權限，不會消耗一次對話生成額度；實際可用額度仍以 Google AI Studio 為準。")
     key = st.text_input("Gemini API Key", type="password", value=st.session_state.api_key)
     if st.button("測試 API Key"):
         try:
@@ -620,7 +621,17 @@ def render_chat() -> None:
     try:
         with st.spinner("AI 正在回應…"):
             generate_ai_turn(is_opening=False, latest_student_message=prompt)
+    except GeminiQuotaError as exc:
+        store_turn(new_turn(
+            session=session,
+            turn_index=len(st.session_state.turns) + 1,
+            speaker_role="system",
+            content=str(exc),
+            timezone=CONFIG.timezone,
+            error_flag="gemini_quota_exhausted",
+        ))
     except Exception as exc:
+        LOGGER.exception("Gemini dialogue request failed")
         store_turn(new_turn(
             session=session,
             turn_index=len(st.session_state.turns) + 1,
